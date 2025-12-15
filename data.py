@@ -4,7 +4,8 @@ import os
 from datetime import datetime, timezone
 from typing import Literal, Dict, Any, cast
 
-STORAGE_DIR = "." # Current directory
+STORAGE_DIR = "yfdata" # New directory for storing data files
+os.makedirs(STORAGE_DIR, exist_ok=True)
 
 def fetch_and_store_stock_data(
     ticker: str, 
@@ -23,10 +24,13 @@ def fetch_and_store_stock_data(
         df = pd.DataFrame() 
         
         if report_type == "price":
-            df = stock.history(period="5d")
+            df = stock.history(period="2mo", interval="1d")
             if df.empty:
                 raise ValueError(f"No price data found for {ticker}")
+            
+            df = df.iloc[::2]
             df.reset_index(inplace=True)
+
 
         elif report_type == "income_stmt":
             df = stock.financials.T 

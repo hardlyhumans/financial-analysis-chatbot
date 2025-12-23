@@ -5,13 +5,13 @@ from datetime import datetime, timedelta
 
 
 
-BASE_OUTPUT_DIR = "../../../data"   
+BASE_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "..", "data")   
 
 
 CHUNK_SIZE_DAYS = 90
 TOTAL_HISTORY_DAYS = 365  
 
-BSE_BASE_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
+BSE_BASE_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 BSE_PDF_URL = "https://www.bseindia.com/xml-data/corpfiling/AttachLive/"
 
 HEADERS = {
@@ -21,7 +21,7 @@ HEADERS = {
         "Chrome/120.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
-    "Referer": "https://www.bseindia.com/corporates/ann.html",
+    "Referer": "https://www.bseindia.com/",
     "Origin": "https://www.bseindia.com",
 }
 
@@ -64,10 +64,14 @@ def get_date_chunks(days_back: int):
 
 def fetch_bse_metadata_chunk(scrip_code: str, date_from: str, date_to: str):
     params = {
+        "pageno": "1",
         "strCat": "-1",
-        "strPrevDate": date_from,
-        "strScrip": scrip_code,
-        "strToDate": date_to,
+        "strPrevDate": date_from,   
+        "strScrip": scrip_code,     
+        "strSearch": "P",
+        "strToDate": date_to,       
+        "strType": "C",             
+        "subcategory": "-1"
     }
 
     try:
@@ -102,15 +106,17 @@ def process_company(ticker: str, scrip_code: str):
             fname = row.get("ATTACHMENTNAME")
             subject = row.get("NEWSSUB") or "Document"
             date = row.get("NEWS_DT") or "UnknownDate"
+            is_old = row.get("OLD") == 1
 
             if fname and fname.lower().endswith(".pdf"):
+                base_url = "https://www.bseindia.com/xml-data/corpfiling/AttachHis/" if is_old else BSE_PDF_URL
                 all_pdfs.append({
-                    "url": BSE_PDF_URL + fname,
+                    "url": base_url + fname,
                     "subject": subject,
                     "date": date,
                 })
 
-        time.sleep(0.5)
+        time.sleep(1)
 
     print(f"Found {len(all_pdfs)} PDF filings")
 
@@ -128,12 +134,14 @@ def process_company(ticker: str, scrip_code: str):
             continue
 
         try:
+            print(f"      -> Downloading: {filename}")
             r = requests.get(doc["url"], headers=HEADERS, timeout=20)
             r.raise_for_status()
             with open(path, "wb") as f:
                 f.write(r.content)
             downloaded += 1
-        except Exception:
+        except Exception as e:
+            print(f"      [!] Failed to download {filename}: {e}")
             pass
 
     print(f"Downloaded {downloaded} new PDFs")

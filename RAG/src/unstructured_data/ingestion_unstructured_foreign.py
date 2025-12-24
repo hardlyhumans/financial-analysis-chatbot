@@ -34,9 +34,12 @@ import os
 import json
 import requests
 import re
+from bs4 import BeautifulSoup
 from datetime import datetime, timezone
+from bs4 import XMLParsedAsHTMLWarning
+import warnings
 
-
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 BASE_DIR = "../../../data"
 
@@ -45,94 +48,143 @@ HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
-MAX_TOTAL_CHARS = 40_000
-MAX_SECTION_CHARS = 10_000
-
-SECTION_PATTERNS = [
-    r"Item\s+7\.\s+Management",     # MD&A 
-    r"Item\s+1A\.\s+Risk",          # Risk factors
-    r"Item\s+1\.\s+Business",       # Business & segments
-    r"Item\s+7A\.",                 # Market risk 
- 
-]
+MAX_OUTPUT_CHARS = 80_000
 
 
-def get_latest_10k_metadata(cik: str) -> dict | None:
+def get_latest_10k_metadata(cik: str) -> dict:
     url = f"https://data.sec.gov/submissions/CIK{cik.zfill(10)}.json"
     r = requests.get(url, headers=HEADERS, timeout=15)
     r.raise_for_status()
 
-    filings = r.json().get("filings", {}).get("recent", {})
+    filings = r.json()["filings"]["recent"]
 
-    for form, acc, primary, filing_date in zip(
-        filings.get("form", []),
-        filings.get("accessionNumber", []),
-        filings.get("primaryDocument", []),
-        filings.get("filingDate", []),
+    for form, acc, date in zip(
+        filings["form"],
+        filings["accessionNumber"],
+        filings["filingDate"],
     ):
         if form == "10-K":
             return {
                 "accession": acc.replace("-", ""),
-                "primary_doc": primary,
-                "filing_date": filing_date,
+                "filing_date": date,
             }
 
-    return None
+    raise RuntimeError("No 10-K filing found.")
 
 
-def fetch_filing_html(cik: str, accession: str, primary_doc: str) -> str:
-    url = (
+def find_real_10k_html(cik: str, accession: str) -> str:
+    index_url = (
         f"https://www.sec.gov/Archives/edgar/data/"
-        f"{int(cik)}/{accession}/{primary_doc}"
+        f"{int(cik)}/{accession}/index.json"
     )
-    r = requests.get(url, headers=HEADERS, timeout=15)
+
+    r = requests.get(index_url, headers=HEADERS, timeout=15)
     r.raise_for_status()
-    return r.text
 
+    candidates = []
 
-def extract_high_signal_sections(text: str) -> str:
-    extracted = []
-    total_chars = 0
+    for f in r.json()["directory"]["item"]:
+        name = f.get("name", "").lower()
 
-    for pattern in SECTION_PATTERNS:
-        match = re.search(pattern, text, flags=re.I)
-        if not match:
+        if not name.endswith((".htm", ".html")):
+            continue
+        if "ix" in name or "xbrl" in name:
             continue
 
-        chunk = text[
-            match.start() : match.start() + MAX_SECTION_CHARS
-        ]
+        try:
+            size = int(f.get("size", 0))
+        except (TypeError, ValueError):
+            size = 0
 
-        extracted.append(chunk)
-        total_chars += len(chunk)
+        candidates.append((size, name))
 
-        if total_chars >= MAX_TOTAL_CHARS:
-            break
+    if not candidates:
+        raise RuntimeError("No narrative HTML found.")
 
-    if not extracted:
-        return text[:MAX_TOTAL_CHARS]
+    _, best = max(candidates)
 
-    return "\n\n".join(extracted)[:MAX_TOTAL_CHARS]
+    return (
+        f"https://www.sec.gov/Archives/edgar/data/"
+        f"{int(cik)}/{accession}/{best}"
+    )
 
+
+def normalize_html_to_text(html: str) -> str:
+    html = re.sub(r"</?ix:[^>]+>", " ", html, flags=re.I)
+
+    soup = BeautifulSoup(html, "lxml")
+    text = soup.get_text("\n")
+    text = re.sub(r"\n{2,}", "\n", text).strip()
+
+    start = re.search(
+        r"UNITED STATES\s+SECURITIES AND EXCHANGE COMMISSION",
+        text,
+        re.I,
+    )
+    if start:
+        text = text[start.start():]
+
+    if len(text) < 100_000:
+        raise RuntimeError("Not a full 10-K narrative.")
+
+    return text
+
+
+def extract_high_signal_text(text: str) -> str:
+    def between(start, end):
+        s = re.search(start, text, re.I | re.S)
+        e = re.search(end, text, re.I | re.S)
+        if s and e and e.start() > s.end():
+            return text[s.start():e.start()]
+        return None
+
+    sections = []
+
+    business = between(
+        r"Item\s+1\b.*?Business",
+        r"Item\s+1A\b",
+    )
+
+    risk = between(
+        r"Item\s+1A\b",
+        r"Item\s+1B\b",
+    )
+
+    mdna = between(
+        r"Item\s+7\b.*?Management",
+        r"Item\s+7A\b",
+    )
+
+    market_risk = between(
+        r"Item\s+7A\b",
+        r"Item\s+8\b",
+    )
+
+    for sec in (business, risk, mdna, market_risk):
+        if sec and len(sec) > 5_000:
+            sections.append(sec.strip())
+
+    if not sections:
+        return text[:MAX_OUTPUT_CHARS]
+
+    final = "\n\n".join(sections)
+
+    if len(final) > MAX_OUTPUT_CHARS:
+        final = final[:MAX_OUTPUT_CHARS]
+
+    return final
 
 
 def ingest_sec_unstructured(*, ticker: str, cik: str) -> dict:
     if not cik.isdigit():
-        raise ValueError("Invalid CIK. SEC ingestion aborted.")
+        raise ValueError("Invalid CIK.")
 
     meta = get_latest_10k_metadata(cik)
-    if not meta:
-        raise RuntimeError("No 10-K filing found for provided CIK.")
+    filing_url = find_real_10k_html(cik, meta["accession"])
 
-    html = fetch_filing_html(
-        cik=cik,
-        accession=meta["accession"],
-        primary_doc=meta["primary_doc"],
-    )
-
-    text = re.sub(r"<[^>]+>", " ", html)
-    text = re.sub(r"\s+", " ", text)
-    text = extract_high_signal_sections(text)
+    html = requests.get(filing_url, headers=HEADERS, timeout=20).text
+    full_text = normalize_html_to_text(html)
+    signal_text = extract_high_signal_text(full_text)
 
     record = {
         "company": ticker,
@@ -142,27 +194,23 @@ def ingest_sec_unstructured(*, ticker: str, cik: str) -> dict:
         "filing_date": meta["filing_date"],
         "accession": meta["accession"],
         "fetched_at": datetime.now(timezone.utc).isoformat(),
-        "data_version": "v1.0",
-        "text": text,
+        "data_version": "v5.0",
+        "text": signal_text,
     }
 
     out_dir = os.path.join(BASE_DIR, ticker, "unstructured")
     os.makedirs(out_dir, exist_ok=True)
 
-    out_path = os.path.join(out_dir, "data.json")
-    with open(out_path, "w", encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "data.json"), "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2)
 
     return record
 
 
 if __name__ == "__main__":
-    result = ingest_sec_unstructured(
+    res = ingest_sec_unstructured(
         ticker="MSFT",
         cik="0000789019",
     )
+    print("Stored chars:", len(res["text"]))
 
-    print("Company:", result["company"])
-    print("Filing date:", result["filing_date"])
-    print("Characters:", len(result["text"]))
-    print("Saved to:", f"{BASE_DIR}/MSFT/unstructured/data.json")
